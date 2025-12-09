@@ -1,6 +1,10 @@
-import Client from "../index.ts";
 import { describe, test, expect } from "vitest";
-import { fastify as Fastify } from "fastify";
+
+import { VoidLogger } from "./helpers/void-logger.ts";
+import { WebhookServer } from "./helpers/webhook-server.ts";
+
+import Client from "../index.ts";
+import { getPayload } from "./helpers/get-payload.ts";
 
 describe("client", () => {
   describe("createChannel", () => {
@@ -10,7 +14,7 @@ describe("client", () => {
     });
 
     test("throws if could not create a new channel", async () => {
-      expect(
+      await expect(
         Client.createChannel({
           // @ts-ignore
           fetch: async () => {
@@ -28,20 +32,41 @@ describe("client", () => {
   describe("constructor", () => {
     describe("source", () => {
       test("throws if source is not a valid URL", () => {
-        expect(
-          () =>
-            new Client({
-              source: "mailto:do-not-reply@example.com",
-              target: "https://example.com",
-            }),
-        ).toThrow("The provided URL is invalid.");
+        [
+          "mailto:do-not-reply@example.com",
+          "ftp://www.google.com/",
+          "123455",
+        ].forEach((source) => {
+          expect(
+            () =>
+              new Client({
+                source,
+                target: "https://example.com",
+              }),
+            source,
+          ).toThrow("The provided URL is invalid.");
+        });
+        [
+          "https:/smee.io/CHANNEL",
+          "http://www.example.com:80",
+          "https://www.example.com:443",
+        ].forEach((source) => {
+          expect(
+            () =>
+              new Client({
+                source,
+                target: "https://example.com",
+              }),
+            source,
+          ).not.toThrow("The provided URL is invalid.");
+        });
       });
     });
   });
 
   describe("onmessage", () => {
     test("returns a new channel", async () => {
-      expect.assertions(2);
+      expect.assertions(7);
 
       let finishedPromise = {
         promise: undefined,
@@ -59,57 +84,45 @@ describe("client", () => {
       });
 
       let callCount = 0;
-      const fastify = Fastify();
 
-      fastify.route({
-        url: "/",
-        method: "POST",
-        handler: async (request, reply) => {
-          callCount++;
+      const server = new WebhookServer({
+        handler: async (req, res) => {
+          try {
+            expect(req.method).toBe("POST");
+            expect(req.url).toBe("/");
 
-          expect(JSON.stringify(request.body)).toBe(
-            JSON.stringify({ hello: "world" }),
-          );
+            const body = await getPayload(req);
 
-          if (callCount === 2) {
-            finishedPromise.resolve!();
+            expect(body).toBe(JSON.stringify({ hello: "world" }));
+
+            res.writeHead(200, { "content-type": "application/json" });
+            res.end(body);
+
+            ++callCount;
+
+            if (callCount === 2) {
+              finishedPromise.resolve!();
+            }
+          } catch (err) {
+            finishedPromise.reject!(err);
           }
-          return reply
-            .send(request.body)
-            .header("content-type", "application/json");
         },
       });
 
-      const target = await fastify.listen();
+      await server.start();
 
+      const target = server.url;
       const source = await Client.createChannel();
+
       const client = new Client({
         source,
         target,
+        logger: new VoidLogger(),
       });
 
-      let readyPromise = {
-        promise: undefined,
-        reject: undefined,
-        resolve: undefined,
-      } as {
-        promise?: Promise<any>;
-        resolve?: (value?: any) => any;
-        reject?: (reason?: any) => any;
-      };
+      await client.start();
 
-      readyPromise.promise = new Promise((resolve, reject) => {
-        readyPromise.resolve = resolve;
-        readyPromise.reject = reject;
-      });
-
-      client.onopen = readyPromise.resolve!;
-      client.onerror = readyPromise.reject!;
-      client.start();
-
-      await readyPromise.promise;
-
-      await fetch(target + "/", {
+      await fetch(target, {
         method: "POST",
         body: JSON.stringify({ hello: "world" }),
         headers: {
@@ -126,6 +139,10 @@ describe("client", () => {
       });
 
       await finishedPromise.promise;
+
+      await server.stop();
+
+      expect(callCount).toBe(2);
     });
   });
 });
